@@ -629,12 +629,22 @@ make run/m5_async/01_timing_trap
 并回答下列问题：
 (a)~哪个数值可以当作 kernel 耗时写进报告？(b)~另外两个各具体测的是什么？
 
+cudaEvent计时是kernel耗时，另外两个一个是kernel启动时间，一个是kernel启动+执行（+同步开销）时间。
+
 \prob{5.2}{CONCEPT}
 判断对错，可以顺带补一句理由。
 \begin{enumerate}[label=(\alph*)]
   \item 同一个 stream 里的操作按提交顺序执行。
+
+  正确
+
   \item kernel 启动后，host 代码立刻继续往下执行。
+
+  正确
+
   \item unified memory 下，CPU 访问一页正被 GPU 占用的内存，会触发缺页与页迁移。
+
+  正确
 \end{enumerate}
 
 \begin{lookback}
@@ -656,8 +666,17 @@ Guide 1.2.2.3（必读，篇幅不长）、2.4.1--2.4.6（浏览）、2.2（知�
 判断对错，可以顺带补一句理由。
 \begin{enumerate}[label=(\alph*)]
   \item tile 是显存里的一块可变区域，kernel 通过指针直接改写它。
+
+  错误。是CUDA编程模型的逻辑抽象。
+
   \item 对 tile 的一次运算（如两个 tile 相加）由编译器映射到 block 内的多个线程上执行。
+
+  正确
+
   \item tile 模型与 SIMT 模型互斥，一个 CUDA 程序只能选一种。
+
+  错误。tile模型是构建在SIMT之上的高层抽象，而非替代关系。
+
 \end{enumerate}
 
 \prob{6.2}{CONCEPT}
@@ -681,20 +700,37 @@ def vec_add(a, b, c, TILE: ct.Constant[int]):
 据此补全下表（Triton 一列可以做完 Module 7 再回来填）：
 
 \begin{center}\small
-\begin{tabular}{@{}lp{8em}p{9em}p{9em}@{}}
+\begin{tabular}{@{}l p{7.8em} p{9.2em} p{9.2em} @{}}
 \toprule
  & CUDA SIMT & cuTile & Triton \\
 \midrule
-并行单位 & block 里的 thread & block & \\
-编号 & \texttt{blockIdx} / \texttt{threadIdx} &  & \\
-数据分工 & 线程用全局下标来划分数据 &  & \\
-边界处理 & \texttt{if} 判断 &  & \\
+并行单位
+  & block 内的 thread
+  & \texttt{block}
+  & program（逻辑 \texttt{block}） \\
+\addlinespace[2pt]
+编号
+  & \texttt{blockIdx} / \texttt{threadIdx}
+  & \texttt{bid = ct.bid(0)}
+  & \texttt{pid = tl.program\_id(axis)} \\
+\addlinespace[2pt]
+数据分工
+  & 线程按全局下标划分数据
+  & \texttt{block} 通过 tile view 划分数据，每个 \texttt{block} 加载一个 tile
+  & program 通过 \texttt{tl.make\_block\_ptr} 划分数据，每个 program 加载一个 tile \\
+\addlinespace[2pt]
+边界处理
+  & \texttt{if} 显式判断
+  & tile view + 自动 padding / 裁剪（隐式）
+  & mask（\texttt{tl.where}、\texttt{mask=}，隐式） \\
 \bottomrule
 \end{tabular}
 \end{center}
 
 \prob{6.3}{CONCEPT}
 仍看上面这段代码。(a)~“每个线程对应哪个/些元素”由谁决定？(b)~列出一些在 CUDA SIMT 版向量加法里一定会出现、这里完全没体现出的概念。
+
+每个线程对应哪个/些元素”由编译器决定，这里没有同步，没有计算各种下标，没有寄存器/共享内存手动显式分配，线程的映射与合作方式完全没有体现。
 
 \begin{lookback}
 tile 并非某个 DSL 的发明。NVIDIA 自己把它与 SIMT 并列写进了 Guide 正文，这本身就说明它是一类稳定的编程方式，而不是一次工具选型。
@@ -732,6 +768,8 @@ uv run pytest tests/test_fused_op.py
 
 改完回答——与 Module 2 里改 CUDA kernel 相比，这次的改动主要集中在 kernel 的什么部分？主体代码为什么一行都不用动？
 
+集中在计算逻辑部分，因为访存、边界等全都一致，tile视角将计算逻辑与tiling逻辑解耦了。
+
 \prob{7.3}{FILL-IN}[kernels/tilelang\_scale\_add.py]
 请填空：\texttt{kernels/tilelang\_scale\_add.py} ，具体要求见代码注释。测试命令：
 
@@ -751,6 +789,8 @@ uv run pytest tests/test_tilelang.py -k copy2d
 
 填完想一想：2.6 的四个空——行号、列号、边界保护、grid 尺寸——哪些在这里还有对应？没有对应的那个去哪了？
 
+行列号还有，变成了tile的地址；grid尺寸与cuda的类似；边界保护没有了，因为T.copy知道真实shape，会自己推导tile是否越界。
+
 \prob{7.5}{CONCEPT}
 补全下表，每个空填“用户”或“编译器”（二者都涉及的要写清楚各自的范围）。
 
@@ -759,10 +799,10 @@ uv run pytest tests/test_tilelang.py -k copy2d
 \toprule
 谁负责 & CUDA SIMT & cuTile & Triton & TileLang \\
 \midrule
-线程到数据的映射 & 用户 & & & \\
-边界处理 & 用户 & & & \\
-tile / block 尺寸的选择 & 用户 & & & \\
-block 内同步 & 用户 & & & \\
+线程到数据的映射 & 用户 & 编译器 & 编译器 & 编译器 \\
+边界处理 & 用户 & 用户 & 用户 & 编译器 \\
+tile / block 尺寸的选择 & 用户 & 用户 & 用户 & 用户 \\
+block 内同步 & 用户 & 编译器 & 编译器 & 编译器\\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -776,6 +816,8 @@ uv run pytest tests/test_tilelang.py -k matmul
 \end{lstlisting}
 
 填完回答——这五个空涉及到了 shared memory、寄存器 tile、流水，而 Triton 版 matmul（Bonus 的 \texttt{kernels/matmul\_triton.py}）并未被显式指定，为什么？
+
+他们的抽象层次不同，Triton中的这些都是自动推导的。
 
 \begin{capstone}{prob 7.7（FROM-SCRATCH）：softmax in TileLang \hfill {\footnotesize\ttfamily kernels/tilelang\_softmax.py}}
 在 \texttt{kernels/tilelang\_softmax.py} 里从零实现行 softmax，具体要求见文件开头的 docstring。
@@ -796,6 +838,8 @@ cd assignment01
 uv run pytest tests/test_softmax.py
 \end{lstlisting}
 
+规约：两者都是一行命令解决，让编译器来处理如何加和；边界处理：tilelang是编译器隐式处理，但是shared memory多分配的部分还是要自己处理数值的准确性，triton则是要自己来写mask；tile形状则是两者都是用户指定的。
+
 \begin{lookback}
 本模块把前面写过的 kernel 用 TileLang 和 Triton 各重写了一遍。两种写法的区别，基本都收在 prob 7.5 那张对比表里：线程到数据的映射归谁管，边界归谁处理，tile 尺寸归谁选定，同步又归谁插入。DSL 的价值并不在于代码更短，而在于它把前两项交给编译器，同时把后两项——那些必须靠实测才能定下来的旋钮——继续留给你。
 
@@ -813,9 +857,20 @@ Guide 1.3 全章（必读）、2.1.1、2.7（浏览）。
 判断对错，可以顺带补一句理由。
 \begin{enumerate}[label=(\alph*)]
   \item PTX 是 GPU 直接执行的机器码。
+
+  错误。PTX是汇编码，GPU执行的是SASS。
+
   \item 只嵌入了 \texttt{sm\_70} SASS 的可执行文件，能在 compute capability 9.0 的卡上运行。
+
+  错误。两者不兼容。
+
   \item 一个 fatbin 可以同时携带多个架构的 SASS 和 PTX。
+
+  正确
+
   \item JIT 编译由驱动在运行时完成。
+  
+  正确
 \end{enumerate}
 
 \prob[Optional]{8.2}{EXPERIMENT}[cuda/m0\_env/01\_hello.cu]
@@ -837,8 +892,12 @@ make ptxonly/m0_env/01_hello
 ./bin/m0_env/01_hello_ptxonly
 \end{lstlisting}
 
+生成不匹配的SASS不能运行，生成不匹配的PTX可以正常运行，PTX在程序运行时由CUDA Driver JIT compiler编译成符合的SASS。
+
 \prob[Optional]{8.3}{CONCEPT}
 请简单说明 Runtime API 与 Driver API 各自的定位。\texttt{cudaMalloc} 属于哪个？
+
+Runtime API是好用的上层封装，面向应用开发者；Driver API是底层控制接口，面向框架/驱动开发者。cudaMalloc是CUDA Runtime API。
 
 \begin{lookback}
 Module 0 里那个“能跑就行”的 hello，现在被拆开重新看过：源码经 nvcc 分成 host 和 device 两路，device 端产出 PTX 与 SASS，一并打包进 fatbin；运行时 driver 再从中挑选合适的版本，或者对 PTX 做 JIT。
@@ -860,20 +919,75 @@ cd assignment01/cuda
 make run/bonus/matmul
 nvcc -O2 -std=c++17 -I. -arch=native -DBS=8 -o bin/bonus/matmul_bs8 bonus/matmul.cu && ./bin/bonus/matmul_bs8
 \end{lstlisting}
+
+% ch=native -DBS=32 -o bin/bonus/matmul_bs32 bonus/matmul.cu &&./bin/bonus/matmul_bs32
+% BS=32  平均 0.371 ms  5786.8 GFLOPS
+% PASS
+
+% ch=native -DBS=16 -o bin/bonus/matmul_bs16 bonus/matmul.cu &&./bin/bonus/matmul_bs16
+% BS=16  平均 0.335 ms  6413.9 GFLOPS
+% PASS
+
+% ch=native -DBS=8 -o bin/bonus/matmul_bs8 bonus/matmul.cu &&./bin/bonus/matmul_bs8
+% BS=8  平均 0.412 ms  5210.3 GFLOPS
+% PASS
+
   \item Tiled Triton：\texttt{kernels/matmul\_triton.py}（多组 tile 配置 + cuBLAS 对照），记录实测数据。
 \begin{lstlisting}
 cd assignment01
 uv run python -c "from kernels.matmul_triton import bench; bench()"
 \end{lstlisting}
+
+% BLOCK_M=  32 BLOCK_N=  32 BLOCK_K= 32     0.168 ms   102.0 TFLOPS
+% BLOCK_M=  64 BLOCK_N=  64 BLOCK_K= 32     0.114 ms   150.9 TFLOPS
+% BLOCK_M= 128 BLOCK_N=  64 BLOCK_K= 32     0.073 ms   234.9 TFLOPS
+% BLOCK_M= 128 BLOCK_N= 128 BLOCK_K= 32     0.079 ms   216.8 TFLOPS
+% BLOCK_M= 128 BLOCK_N= 128 BLOCK_K= 64     0.102 ms   168.1 TFLOPS
+% BLOCK_M=  64 BLOCK_N=  64 BLOCK_K= 64     0.093 ms   184.8 TFLOPS
+% torch (cuBLAS)                         0.073 ms   235.3 TFLOPS
+
   \item TileLang：\texttt{kernels/tilelang\_matmul.py}（即 prob 7.6 补全的成品），调 \texttt{bench()} 的 \texttt{block\_M / block\_N / block\_K / num\_stages}，记录实测数据。
 \begin{lstlisting}
 cd assignment01
 uv sync --extra tilelang
 uv run python -c "from kernels.tilelang_matmul import bench; bench()"
 \end{lstlisting}
+
+% 2026-07-31 15:18:25  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:129): TileLang begins to compile kernel `main` with `out_idx=[2]`
+% 2026-07-31 15:18:27  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang completes to compile kernel `main`
+% block_M=  64 block_N=  64 block_K= 32 threads=128 stages=1     0.229 ms    75.1 TFLOPS
+% 2026-07-31 15:18:27  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:129): TileLang begins to compile kernel `main` with `out_idx=[2]`
+% 2026-07-31 15:18:28  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang completes to compile kernel `main`
+% block_M=  64 block_N=  64 block_K= 32 threads=128 stages=3     0.128 ms   134.5 TFLOPS
+% 2026-07-31 15:18:29  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:129): TileLang begins to compile kernel `main` with `out_idx=[2]`
+% 2026-07-31 15:18:30  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang completes to compile kernel `main`
+% block_M= 128 block_N= 128 block_K= 32 threads=128 stages=3     0.096 ms   178.2 TFLOPS
+% 2026-07-31 15:18:30  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:129): TileLang begins to compile kernel `main` with `out_idx=[2]`
+% 2026-07-31 15:18:31  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang completes to compile kernel `main`
+% block_M= 128 block_N= 128 block_K= 64 threads=256 stages=3     0.084 ms   205.6 TFLOPS
+% 2026-07-31 15:18:32  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:129): TileLang begins to compile kernel `main` with `out_idx=[2]`
+
 \end{enumerate}
 
+\begin{table}[htbp]
+\centering
+\caption{不同 MatMul 实现的性能对比}
+\label{tab:matmul-comparison}
+\begin{tabular}{@{}llcc@{}}
+\toprule
+\textbf{实现方式} & \textbf{最佳配置} & \textbf{峰值吞吐} & \textbf{相对 cuBLAS} \\
+\midrule
+Naive CUDA   & \texttt{BS=16}                                & 6.4 TFLOPS  & 2.7\%  \\
+Triton       & \texttt{BM=128, BN=64, BK=32}                & 234.9 TFLOPS & 99.8\% \\
+TileLang     & \texttt{BM=128, BN=128, BK=64, threads=256, stages=3} & 205.6 TFLOPS & 87.4\% \\
+cuBLAS (torch) & --                                            & 235.3 TFLOPS & 100\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
 试分析性能差距的原因，特别是：TileLang 的控制粒度比 Triton 更细，为什么在这组测试里反而略慢？
+
+虽然 TileLang 提供了比 Triton 更细粒度的硬件控制能力，但在本实验中并未转化为性能优势。主要原因包括：Triton 拥有经过大量硬件验证的自动调度策略，能够在寄存器压力、shared memory 布局、warp 利用率和 pipeline 深度之间自动取得较优平衡；而 TileLang 将更多调度决策暴露给用户，若缺乏精细的 cost model 和自动搜索机制，容易陷入次优配置空间（如过大的 block、过高的线程数或不匹配的 tile shape）。因此，在同等人工调参条件下，Triton 的表现反而更稳定、更接近 cuBLAS。
 
 注：A100 实测参考——naive CUDA 约 2.4 TFLOPS，Triton 约 125 TFLOPS，TileLang 约 118 TFLOPS，cuBLAS 约 173 TFLOPS，而 A100 fp16 tensor core 的标称上限是 312 TFLOPS。Triton 与 TileLang 的数字只是各自 \texttt{bench()} 里那几组配置中的最优，不代表工具的性能上限；tilelang 本身也还在快速迭代（本仓库固定在 0.1.12），数字会随版本变化。
 \begin{lookback}

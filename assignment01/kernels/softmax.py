@@ -18,5 +18,61 @@ import triton
 import triton.language as tl
 
 
+@triton.jit
+def softmax_kernel(
+    x_ptr,
+    y_ptr,
+    M,
+    N,
+    stride_xm,
+    stride_ym,
+    BLOCK_N: tl.constexpr,
+):
+    # ---- program id = row index ----
+    pid_m = tl.program_id(axis=0)
+    offs_m = pid_m
+
+    # ---- column offsets ----
+    offs_n = tl.arange(0, BLOCK_N)
+
+    # ---- load ----
+    x_ptrs = x_ptr + offs_m * stride_xm + offs_n
+    x_mask = offs_n < N
+    x = tl.load(x_ptrs, mask=x_mask, other=-float("inf"))
+
+    # ---- row max ----
+    row_max = tl.max(x, axis=0)
+
+    # ---- subtract max + exp ----
+    x = x - row_max
+    e = tl.exp(x)
+
+    # ---- row sum ----
+    row_sum = tl.sum(e, axis=0)
+
+    # ---- normalize ----
+    y = e / row_sum
+
+    # ---- store ----
+    y_ptrs = y_ptr + offs_m * stride_ym + offs_n
+    tl.store(y_ptrs, y, mask=x_mask)
+    
+
 def softmax(x: torch.Tensor) -> torch.Tensor:
-    raise NotImplementedError("从这里开始写")
+    assert x.is_cuda and x.dtype == torch.float32
+    M, N = x.shape
+    y = torch.empty_like(x)
+
+    BLOCK_N = triton.next_power_of_2(N)
+
+    grid = (M,)
+    softmax_kernel[grid](
+        x,
+        y,
+        M,
+        N,
+        x.stride(0),
+        y.stride(0),
+        BLOCK_N=BLOCK_N,
+    )
+    return y

@@ -22,7 +22,62 @@ Tip: elementwise + 行内归约的 kernel 大概率是带宽瓶颈，可以想�
 import torch
 import tilelang
 import tilelang.language as T
+from functools import lru_cache
+
+
+def make_softmax(M, N, dtype="float32"):
+    block_N = 1 << (N - 1).bit_length()
+
+    @T.prim_func
+    def softmax_kernel(
+        X: T.Buffer((M, N), dtype),
+        Y: T.Buffer((M, N), dtype),
+    ):
+        with T.Kernel(M, threads=128) as bx:
+            X_shared = T.alloc_shared((block_N,), dtype)
+            E_shared = T.alloc_shared((block_N,), dtype)
+
+            # ---- load ----
+            T.copy(X[bx, 0], X_shared)
+
+            # ---- row max (vector reduce!) ----
+            max_val = T.alloc_fragment((1,), dtype)
+            T.reduce_max(X_shared, max_val, dim=0, clear=True)
+            row_max = max_val[0]
+
+            # ---- exp ----
+            for n in T.Parallel(block_N):
+                v = X_shared[n]
+                e = T.exp(v - row_max)
+                E_shared[n] = T.if_then_else(n < N, e, 0.0)
+
+            # ---- row sum ----
+            sum_val = T.alloc_fragment((1,), dtype)
+            T.reduce_sum(E_shared, sum_val, dim=0, clear=True)
+            row_sum = sum_val[0]
+
+            # ---- normalize ----
+            for n in T.Parallel(block_N):
+                Y[bx, n] = T.if_then_else(
+                    n < N,
+                    E_shared[n] / row_sum,
+                    0.0,
+                )
+
+    return softmax_kernel
+
+
+@lru_cache(maxsize=128)
+def make_softmax_compiled(M, N):
+    prim_func = make_softmax(M, N)
+    return tilelang.compile(
+        prim_func,
+        out_idx=[1],
+    )
 
 
 def softmax(x: torch.Tensor) -> torch.Tensor:
-    raise NotImplementedError("从这里开始写")
+    assert x.is_cuda and x.dtype == torch.float32
+    M, N = x.shape
+    kernel = make_softmax_compiled(M, N)
+    return kernel(x)
