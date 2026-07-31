@@ -40,11 +40,76 @@
 
 __global__ void reduce_interleaved(const float *in, float *out) {
     // TODO：从这里开始写（交错配对版本）
+    __shared__ float buf[BLOCK];
+
+    int tid = threadIdx.x;
+    int gid = blockIdx.x * blockDim.x + tid;
+
+    buf[tid] = in[gid];
+    __syncthreads();
+
+    for (int s = 1; s < blockDim.x; s *= 2) {
+        if ((tid % (2 * s)) == 0) {
+            buf[tid] += buf[tid + s];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        out[blockIdx.x] = buf[0];
+    }
 }
 
 __global__ void reduce_contiguous(const float *in, float *out) {
     // TODO：从这里开始写（连续配对版本）
+        __shared__ float buf[BLOCK];
+
+    int tid = threadIdx.x;
+    int gid = blockIdx.x * blockDim.x + tid;
+
+    buf[tid] = in[gid];
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s /= 2) {
+        if (tid < s) {
+            buf[tid] += buf[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        out[blockIdx.x] = buf[0];
+    }
 }
+
+__global__ void reduce_version3(const float *in, float *out) {
+    // TODO：从这里开始写（连续配对版本）
+        __shared__ float buf[BLOCK];
+
+    int tid = threadIdx.x;
+    int gid = blockIdx.x * blockDim.x + tid;
+
+    buf[tid] = in[gid];
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 32; s /= 2) {
+        if (tid < s) {
+            buf[tid] += buf[tid + s];
+        }
+        __syncthreads();
+    }
+    if (tid < 32) {
+        buf[tid] += buf[tid + 32];
+    }
+    float val = buf[tid];
+
+    for (int offset = 16; offset > 0; offset /= 2)
+    {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+
+    if (tid == 0)
+        out[blockIdx.x] = val;
+    }
 
 // ---------------- 以下是判测与计时，不要修改 ----------------
 
@@ -97,6 +162,8 @@ int main() {
     float ms_i = run_one(reduce_interleaved, "interleaved", d_in, d_out, h_out,
                          h_partial, nblocks);
     float ms_c = run_one(reduce_contiguous, "contiguous ", d_in, d_out, h_out,
+                         h_partial, nblocks);
+    float ms_v3 = run_one(reduce_version3, "version3 ", d_in, d_out, h_out,
                          h_partial, nblocks);
     // 阈值 1.5x：A100 实测 2.22x、V100 实测 2.33x，两版写成一样时是 ~1x。
     float ratio = report_speedup("interleaved / contiguous", ms_i, ms_c, 1.5f,

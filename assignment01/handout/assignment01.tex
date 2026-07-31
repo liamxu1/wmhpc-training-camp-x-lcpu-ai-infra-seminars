@@ -142,12 +142,12 @@ make run/m0_env/02_device_query
 \toprule
 项目 & 你的卡 \\
 \midrule
-型号 / compute capability & \\
-SM 数量 & \\
-warp 大小 & \\
-shared memory / block & \\
-最大常驻线程 / SM & \\
-显存总量 & \\
+型号 / compute capability & NVIDIA RTX PRO 6000 Blackwell Server Edition / 12.0 \\
+SM 数量 & 188\\
+warp 大小 & 32\\
+shared memory / block & 49152\\
+最大常驻线程 / SM & 1536\\
+显存总量 & 101975851008\\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -171,13 +171,27 @@ Guide 1.1、1.2.1--1.2.2；LCPU 讲义\footnote{\url{https://github.com/interest
 判断对错，可以顺带补一句理由。
 \begin{enumerate}[label=(\alph*)]
   \item 一块标称 100 TFLOPS 的 GPU，执行单条指令的延迟一定低于 5 GHz 的 CPU。
+
+  错误。因为100TFLOPS是靠大量线程叠加起来的，并不代表单条指令执行的快。
+
   \item HBM 的“高带宽”指大块连续访问时的吞吐，零散的随机访问达不到标称值。
+
+  正确。
+
   \item 严格串行的迭代算法（每步依赖上一步的结果），即使换一块算力更强的 GPU 也快不了多少。
+
+  正确。
+
   \item “算力 1000 TFLOPS”意味着每次运算的延迟是 $10^{-15}$ 秒。
+
+  错误。与第一个问题类似。
+
 \end{enumerate}
 
 \prob{1.2}{CONCEPT}
 Session 1 讲座里提过“N 方过百万”这个例子。总计算量 $10^{12}$ FLOP 在当代 GPU 上的运算时间大概是毫秒级，那为什么一个严格在线的串行算法仍然做不到几秒内跑完？（从“延迟”和“吞吐”的角度考虑）
+
+因为理论计算出的运算时间考虑的是GPU的吞吐能力，但是实际上串行算法中每一步计算都要等前一步计算结束，有很高的延迟。
 
 \prob{1.3}{CONCEPT}
 补全下表（thread 一行已填好作为示例）
@@ -187,16 +201,19 @@ Session 1 讲座里提过“N 方过百万”这个例子。总计算量 $10^{12
 \toprule
 执行层次 & 软件含义 & 对应硬件 & 直接可用的存储 & 同步与通信手段 \\
 \midrule
-thread & kernel 的最小执行单位 & 计算单元上的一个 lane & 自己的寄存器 & （自身天然有序） \\
-warp &  &  &  &  \\
-block / CTA &  &  &  &  \\
-grid &  &  &  &  \\
+thread & kernel的最小执行单位 & 计算单元上的一个lane & 自己的寄存器 & （自身天然有序） \\
+warp & SIMT的基本调度单位，32个thread 同拍执行 & SM中的一个warp & thread寄存器，register file & \_\_shfl\_sync等warp内原语，隐式SIMD同步 \\
+block / CTA & 一组协作线程，共享任务分块 & SM内的一组warp & shared memory, L1 Cache & \_\_syncthreads, shared memory读写通信 \\
+grid & 整个kernel的全部线程集合 & 多个SM共同执行 & global memory, constant memory等 & kernel级别同步，通过global memory通信 \\
 \bottomrule
 \end{tabular}
 \end{center}
 
 \prob{1.4}{CONCEPT}
 SIMD 与 SIMT 的区别？另：判断正误——Nvidia GPU 在 Volta 之后每个线程有独立的 program counter，所以 branch divergence 不再有性能代价。
+
+SIMD：程序员写向量化的指令。SIMT：程序员写针对单个线程的指令，多线程有独立逻辑，硬件负责打包执行。
+错误。依然按warp为单位执行指令，会有warp divergence。
 
 \prob{1.5}{EXPERIMENT}[cuda/m1\_why\_gpu/01\_scaling.cu]
 同一个向量加法，四种配置各跑一遍。
@@ -213,13 +230,16 @@ make run/m1_why_gpu/01_scaling
 \toprule
 配置 & 耗时 (ms) & ns / 元素 \\
 \midrule
-CPU 单线程 & & \\
-GPU \texttt{<<<1,1>>>} & & \\
-GPU \texttt{<<<1,256>>>} & & \\
-GPU 铺满 grid & & \\
+CPU 单线程 & 4.133 & 0.99 \\
+GPU \texttt{<<<1,1>>>} & 166.363 & 39.66 \\
+GPU \texttt{<<<1,256>>>} & 2.818 & 0.67 \\
+GPU 铺满 grid & 0.021 & 0.01 \\
 \bottomrule
 \end{tabular}
 \end{center}
+
+(a) GPU是为了吞吐设计的，其单指令延迟性能并不好。
+(b) 靠的是同时跑海量线程
 
 \prob[Optional]{1.6}{FROM-SCRATCH}[kernels/simt\_sim.py]
 SIMT Simulator —— 写一个 warp 的执行模拟器：32 个 lane、共享控制流、带 mask 的分支执行与汇合。请在 \texttt{kernels/simt\_sim.py} 内完成（docstring 里面有具体实现要求）。工作量大概是 50 行以内的 Python。不需要 GPU。注：本题为 Module 3 的实验结果提供理论对照。判测命令如下：
@@ -256,10 +276,20 @@ make run/m2_first_kernel/01_vector_add
 为下列五个场景选择正确的修饰符（如 \texttt{\_\_global\_\_} 等）。
 \begin{enumerate}[label=(\alph*)]
   \item 在 GPU 上执行、由 CPU 侧启动的 kernel 函数。
+
+  \_\_global\_\_
   \item 只会被 kernel 调用的辅助函数。
+
+  \_\_device\_\_
   \item host 和 device 代码都要调用的小工具函数。
+
+  \_\_host\_\_ \_\_device\_\_
   \item 整个 kernel 运行期间不变、所有线程都要读的系数表。
+
+  \_\_constant\_\_
   \item block 内线程共享的暂存数组。
+
+  \_\_shared\_\_
 \end{enumerate}
 
 \prob{2.3}{MODIFY}[cuda/m2\_first\_kernel/02\_vector\_add\_um.cu]
@@ -272,12 +302,24 @@ make run/m2_first_kernel/02_vector_add_um
 
 然后请回答如下问题：(a)~kernel 启动之后、CPU 读结果之前，为什么必须有一次同步？在原先的版本里这次同步发生在哪个调用里？(b)~对比两版“搬运 + kernel + 读回”的耗时，分析差距的原因（谁快谁慢都有可能，与使用的卡有关）。
 
+(a) 因为kernel的执行是异步的，kernel返回后GPU还在执行，需要同步后测得的才是真正的完整计算时间。在memcpy到host时隐式同步了。
+(b) 我这里从28.8ms变成了33.7ms，系统统一管理产生了额外的页迁移开销？
+
 \prob{2.4}{CONCEPT}
 判断对错，可以顺带补一句理由。
 \begin{enumerate}[label=(\alph*)]
   \item \texttt{vectorAdd<<<...>>>(...)} 这条语句返回时，kernel 一定已经执行完毕。
+
+  错误。执行是异步的。
+
   \item 同一个 stream 里，\texttt{cudaMemcpy}（device 到 host）会等它前面的 kernel 全部完成后才开始拷贝。
+
+  正确。
+
   \item kernel 内部的非法访存，会在启动语句处同步地报出来。
+
+  错误。会在同步点或者CUDA API调用时候暴露。
+
 \end{enumerate}
 
 \prob{2.5}{DEBUG}[cuda/m2\_first\_kernel/03\_bug\_launch.cu]
@@ -287,6 +329,8 @@ make run/m2_first_kernel/02_vector_add_um
 cd assignment01/cuda
 make run/m2_first_kernel/03_bug_launch
 \end{lstlisting}
+
+超出了允许的每个block的最大thread数量。kernel launch错误未显式检查，只检查了API返回值。
 
 \prob{2.6}{FILL-IN}[cuda/m2\_first\_kernel/04\_matrix\_add.cu]
 \texttt{04\_matrix\_add.cu} 用二维的 block 和 grid 处理 $1000 \times 700$ 的矩阵，请填空实现矩阵加法。测试命令：
@@ -306,6 +350,8 @@ make run/m2_first_kernel/05_grid_stride
 
 然后请回答——这种写法的价值在哪里？launch 只有 16384 个线程时，性能上要付出什么代价？
 
+launch规模与数据规模解耦，能处理超大规模数据，但每个线程需要做更多工作，很多SM闲置。
+
 \prob{2.8}{EXPERIMENT}[cuda/m2\_first\_kernel/06\_whoami.cu]
 运行下面的程序两三次，观察 16 个 block 打印输出的先后。
 
@@ -315,6 +361,8 @@ make run/m2_first_kernel/06_whoami
 \end{lstlisting}
 
 (a)~顺序由谁决定？(b)~程序的正确性可以依赖 block 的执行顺序吗？这条限制和 Guide 1.1 说的 scalable programming model 有什么关系？
+
+block的执行顺序由GPU硬件调度器决定，具体分配到哪个SM、何时开始执行均不可预测，程序正确性不可以依赖block的执行顺序，这一限制正是CUDA scalable programming model的核心：程序员只描述并行任务，硬件自由调度，从而保证程序在不同规模和不同代际的 GPU 上均可正确扩展。
 
 \begin{capstone}{prob 2.9（FROM-SCRATCH）：SAXPY \hfill {\footnotesize\ttfamily cuda/m2\_first\_kernel/saxpy.cu}}
 在 \texttt{m2\_first\_kernel/} 下写出完整的 CUDA 程序 \texttt{saxpy.cu}，实现 $y \leftarrow 2.0 \cdot x + y$（单精度）。要求如下:
@@ -354,8 +402,17 @@ Guide 2.3.1--2.3.2、1.2.2.2。3.3、3.5 要用 shared memory，用法见 Guide 
 设 \texttt{blockDim = (8, 8, 1)}。
 \begin{enumerate}[label=(\alph*)]
   \item \texttt{threadIdx = (3, 5, 0)} 的线性编号是多少？它在第几个 warp、warp 内第几个 lane？
+  
+  是 3 + 5 * 8 = 43，warpId为1，laneId为11
+
   \item 这个 block 一共占多少个 warp？
+
+  block一共64个线程，占2个warp。
+
   \item 若 \texttt{blockDim = (33, 1, 1)}，占几个 warp？这样配置浪费在哪里？
+
+  也是占2个warp，这样第二个warp只有1个线程在工作，造成浪费。
+
 \end{enumerate}
 
 \prob{3.2}{EXPERIMENT}[cuda/m3\_simt/01\_divergence.cu]
@@ -368,6 +425,8 @@ make run/m3_simt/01_divergence
 
 请解释实测比值，并回答——若两个分支的计算量一大一小，按 thread 编号奇偶分的 kernel 和按 warp 边界对齐分的 kernel 的运行时间分别由什么决定？
 
+预测快两倍，因为按奇偶分的时候发生warp divegence，两个分支分别运行一次。按warp边界对齐分的kernel每个warp都只用走一个分支，运算量大致一半。实际上：warp 内分支 (tid \% 2) : 0.396 ms，按 warp 分支 (tid/32 \% 2):  0.203 ms，比值: 1.95。与预测相似。若计算量一大一小，奇偶分的kernel时间大致为长+短，按warp边界对齐分的kernel运行时间大致按长的来。
+
 \prob{3.3}{EXPERIMENT}[cuda/m3\_simt/02\_sync\_matters.cu]
 \texttt{02\_sync\_matters.cu} 让每个 block 用 shared memory 把自己的 256 个元素倒序。请按文件开头的注释内容进行实验。
 
@@ -377,6 +436,8 @@ make run/m3_simt/02_sync_matters
 \end{lstlisting}
 
 (a)~为什么注释掉 sync 后代码不能正确地运行？(b)~(Optional) 注释掉 sync 后，翻转后的数组错的位置比较随机，但是有些位置一直是对的，试解释原因。（tip: 算一算 $t$ 与 $255-t$ 有没有可能落在同一个 warp）
+
+(a) 因为有的数据还没存入shared memory就被别的线程使用了。 (b) warp内是隐式同步的，但好像不可能落在同一个warp内？或许和底层调度机制相关？
 
 \prob{3.4}{CONCEPT}
 \texttt{\_\_syncthreads} 只能同步本 block 内的 threads，那需要全 grid 同步时，标准做法是什么？
@@ -391,6 +452,8 @@ make run/m3_simt/02_sync_matters
 cd assignment01/cuda
 make run/m3_simt/03_reduce
 \end{lstlisting}
+
+理论上应该连续的更好，因为交错的会有warp divergence，同时连续的访存应该也更友好。但是实测似乎差不多，让AI检查也没检查出来什么问题。第三版优化确实性能有所提高。
 
 \begin{lookback}
 SIMT 让你以单线程的风格编写并行代码，但它只承诺正确性语义，不负责性能语义。本模块的题目正好分别对应这层抽象漏出来的三个口子：warp 才是真实的调度单位（prob 3.2），block 内的并行需要显式同步才能看到彼此的写入（prob 3.3），而 block 之间压根没有提供同步方法（prob 3.4）。
@@ -417,12 +480,12 @@ Guide 2.3.3--2.3.5、2.3.7、1.2.3。
 \toprule
 空间 & 谁可见 & 生命周期 & 片上 / 片外 & 谁管理 \\
 \midrule
-register & 单个线程 & 线程 & 片上 & 编译器 \\
-local &  &  &  &  \\
-shared &  &  &  &  \\
-global &  &  &  &  \\
-constant &  &  &  &  \\
-L1 / L2 cache &  &  &  &  \\
+register & thread & kernel & 片上 & 编译器 \\
+local & thread & kernel & 片外 & 编译器 \\
+shared & block & kernel & 片上 & 程序员 \\
+global & grid & 应用决定 & 片外 & 程序员 \\
+constant & grid & 应用决定 & 片外 & 程序员 \\
+L1 / L2 cache & grid & 自动 & 片上 & GPU 硬件 \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -445,11 +508,22 @@ make run/m4_memory/02_constant_coeff
 
 结果会包含两个版本的耗时（差距可能极小，甚至测不出来性能收益——想想为什么），回答 constant cache 真正的优势在哪种访问模式。
 
+global  : PASS  平均 0.0536 ms
+
+constant: PASS  平均 0.0522 ms
+
+这里访存量很小，且global和constant都能轻松命中缓存，优势不明显。constant适用于大量线程反复读取同一只读数据，kernel寄存器压力大，无法缓存参数。
+
 \prob{4.4}{CONCEPT}
 判断对错，可以顺带补一句理由。
 \begin{enumerate}[label=(\alph*)]
   \item local memory 的“local”指作用域私有，它实际上在片外显存里。
+
+  正确
+
   \item 对数组用运行期才知道的下标做索引，可能迫使它被放进 local memory。
+
+  正确
 \end{enumerate}
 
 \prob{4.5}{FILL-IN}[cuda/m4\_memory/03\_histogram.cu]
@@ -470,6 +544,14 @@ make run/m4_memory/04_histogram_priv
 
 测试结果包含与 naive 实现相比较的耗时、吞吐。试解释提速来自哪里。
 
+naive: PASS  平均 3.5645 ms  (4.71 GB/s)
+
+priv : PASS  平均 0.0159 ms  (1055.20 GB/s)
+
+naive / priv = 224.19x
+
+组内的数据竞争远小于全局的数据竞争，减少了指令串行化，后续全局写需要原子写的次数也大大减少。
+
 \prob{4.7}{EXPERIMENT}[cuda/m4\_memory/05\_bandwidth.cu]
 运行实验，并根据实验数据填表。
 
@@ -485,10 +567,12 @@ make run/m4_memory/05_bandwidth
 \toprule
 stride & 1 & 2 & 4 & 8 & 16 & 32 \\
 \midrule
-GB/s & & & & & & \\
+GB/s & 2567.8 & 3141.4 & 2933.5 & 1828.2 & 1848.6 & 988.5 \\
 \bottomrule
 \end{tabular}
 \end{center}
+
+首先stride较小会带来访存合并，从而充分利用带宽，减少内存事务。但是观察到测得的数据并不单调，可能是gpu硬件的自己的缓存起到了作用。
 
 \prob{4.8}{EXPERIMENT}[cuda/m4\_memory/06\_occupancy.cu]
 \texttt{06\_occupancy.cu}，详细内容见相关文件。实验命令如下：
@@ -503,15 +587,21 @@ make run/m4_memory/06_occupancy
 \begin{center}\small
 \begin{tabular}{@{}lcccccc@{}}
 \toprule
-shared memory / block (KB) & & & & & & \\
-理论驻留 block / SM & & & & & & \\
-occupancy & & & & & & \\
-实测带宽 (GB/s) & & & & & & \\
+shared memory / block (KB) & 0.0 & 13.2 & 15.0 & 18.0 & 29.0 & 55.0 \\
+理论驻留 block / SM & 6 & 6 & 6 & 5 & 3 & 1 \\
+occupancy & 100.0\% & 100.0\% & 100.0\% & 83.3\% & 50\% & 16.7\% \\
+实测带宽 (GB/s) & 1489.3 & 1491.0 & 1491.5 & 1490.8 & 1461.5 & 748.1 \\
 \bottomrule
 \end{tabular}
 \end{center}
 
 请回答：(a)~用程序开头打印的“shared memory / SM”和“最大常驻线程 / SM”，手算其中一个的驻留 block 数和 occupancy，和 API 的结果对照。(b)~带宽为什么随 occupancy 下降？用“延迟隐藏需要足够多的常驻 warp”组织你的解释。(c)~表中带宽随 occupancy 单调下降，但明显不成正比——从 100\% 到 75\% 带宽掉了多少？从 37.5\% 到 12.5\% 又掉了多少？试解释这个差别。
+
+(a) 例如18KB的，BLOCK恒定为256，一个SM最大有1536线程，于是这个上限固定为6。考虑shared memory上限，SM上最多100 KB，一个block要用18KB，故最多放5个。occupancy即为 5 * 256 / 1536 约 83.3\%。
+
+(b) 因为这是个强内存受限的kernel，绝大多数时间都在等global访存，常住的warp越多，就有越多的warp可以给GPU调度去隐藏延迟。
+
+(c) 这里是从100\%->83.3\%，几乎没有变化，而后面到50\%开始有约2\%的带宽下降，而到了16\%则下降了近一半。这是因为高occupancy时gpu有足够的warp来隐藏延迟，多一点少一点都差不多，基本都能打满带宽；而低occupancy的时候，pipeline频繁空转，延迟隐藏不住，每少一个可调度的warp都比较致命。
 
 \begin{lookback}
 本模块的八道题围绕同一个问题展开：数据放在哪一层，以什么模式去取。prob 4.1 给出一幅静态的存储层次地图，prob 4.2 与 4.3 在同一段 stencil 上切换存储位置，prob 4.5 与 4.6 在同一个直方图统计上做同样的变换，prob 4.7 和 4.8 则分别量化访问模式与可并发的请求数量。

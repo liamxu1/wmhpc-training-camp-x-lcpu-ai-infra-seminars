@@ -5,11 +5,11 @@
 
 __global__ void matrixAdd(const float *a, const float *b, float *c, int M, int N) {
     // ====== 空 1：这个线程负责的行号（用 y 方向的内建变量） ======
-    int row = /* 填这里 */;
+    int row = blockDim.y * blockIdx.y + threadIdx.y;
     // ====== 空 2：这个线程负责的列号（用 x 方向的内建变量） ======
-    int col = /* 填这里 */;
+    int col = blockDim.x * blockIdx.x + threadIdx.x;
     // ====== 空 3：二维边界保护 ======
-    if (/* 填这里 */) {
+    if (row < M && col < N) {
         int idx = row * N + col;  // 行优先展开成一维下标
         c[idx] = a[idx] + b[idx];
     }
@@ -37,7 +37,9 @@ int main() {
 
     dim3 threads(16, 16);  // x 方向 16 列，y 方向 16 行
     // ====== 空 4：二维 grid——两个方向都要向上取整 ======
-    dim3 blocks(/* 填这里 */, /* 填这里 */);
+    int block_x = (N + 15) / 16;
+    int block_y = (M + 15) / 16;
+    dim3 blocks(block_x, block_y);
     matrixAdd<<<blocks, threads>>>(d_a, d_b, d_c, M, N);
     CUDA_CHECK_KERNEL();
 
