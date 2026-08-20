@@ -1,0 +1,88 @@
+% pandoc 模板:版式与 assignment01/handout/assignment01.tex 相同,
+% 正文由 handout/src/*.md 生成,不要手工编辑生成出来的 .tex。
+\documentclass[11pt,a4paper,fontset=none]{ctexart}
+
+\setCJKmainfont[BoldFont={Noto Serif CJK SC Bold}]{Noto Serif CJK SC}
+\setCJKsansfont[BoldFont={Noto Sans CJK SC Bold}]{Noto Sans CJK SC}
+\setCJKmonofont{Noto Sans CJK SC}
+\usepackage{geometry}
+\geometry{margin=2.3cm}
+
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs,array,multirow,longtable}
+\usepackage{calc,etoolbox}
+\usepackage{enumitem}
+\setlist{nosep,leftmargin=2em}
+\usepackage{xcolor}
+\definecolor{accent}{RGB}{28,60,120}
+\definecolor{codebg}{RGB}{248,248,246}
+\usepackage[most]{tcolorbox}
+\usepackage{listings}
+\definecolor{strgreen}{RGB}{21,101,42}
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codebg},
+  frame=single, rulecolor=\color{gray!40}, framerule=0.4pt,
+  breaklines=true, columns=fullflexible, keepspaces=true,
+  showstringspaces=false,
+  language=bash,
+  morekeywords={make,nvcc,uv,pytest,python,cd,ncu,nvdisasm},
+  commentstyle=\color{gray!130}\itshape,
+  keywordstyle=\color{accent}\bfseries,
+  stringstyle=\color{strgreen},
+  xleftmargin=4pt, xrightmargin=4pt,
+}
+\usepackage{hyperref}
+\hypersetup{colorlinks, linkcolor=accent, urlcolor=accent}
+\emergencystretch=3em
+\pagestyle{plain}
+
+% pandoc 产物需要的宏
+\providecommand{\tightlist}{\setlength{\itemsep}{0pt}\setlength{\parskip}{0pt}}
+\providecommand{\passthrough}[1]{#1}
+\setlength{\LTpre}{0.6em}
+\setlength{\LTpost}{0.6em}
+
+% 参考资料框
+\newtcolorbox{reading}{enhanced, breakable,
+  colback=gray!5, colframe=gray!50, boxrule=0.5pt, arc=1.5pt,
+  left=7pt, right=7pt, top=5pt, bottom=5pt,
+  title={参考资料}, fonttitle=\bfseries\sffamily\small,
+  coltitle=black, attach title to upper={\quad}}
+
+% 压轴题框
+\newtcolorbox{capstone}[1]{enhanced, breakable,
+  colback=accent!4, colframe=accent!70, boxrule=0.7pt, arc=1.5pt,
+  left=7pt, right=7pt, top=5pt, bottom=5pt,
+  title={#1}, fonttitle=\bfseries\sffamily}
+
+% 回望框
+\newtcolorbox{lookback}{enhanced, breakable,
+  colback=gray!5, colframe=gray!50, boxrule=0.5pt, arc=1.5pt,
+  left=7pt, right=7pt, top=5pt, bottom=5pt,
+  title={Editor's Note}, fonttitle=\bfseries\sffamily\small,
+  coltitle=black, attach title to upper={\quad},
+  before upper app={\setlength{\parskip}{0.5em}}}
+
+% 题目标题:\prob{编号}{TYPE};选做 \prob[Optional]{编号}{TYPE};
+% 末尾可选参数标注涉及的代码文件
+\NewDocumentCommand{\prob}{O{}mmo}{\par\medskip\noindent
+  {\bfseries prob #2}\;{\small\sffamily(#3\IfBlankF{#1}{\,·\,#1})}%
+  \IfValueT{#4}{\hfill{\footnotesize\ttfamily\color{black!60}#4}}\par\nobreak\smallskip\noindent\ignorespaces}
+
+\begin{document}
+
+\begin{center}
+  {\LARGE\bfseries $title$}\\[6pt]
+  {\sffamily $subtitle$}
+\end{center}
+
+\vspace{0.5em}
+\hrule
+\vspace{1em}
+
+\setcounter{section}{-1}
+
+$body$
+
+\end{document}
