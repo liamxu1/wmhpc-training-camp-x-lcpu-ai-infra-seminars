@@ -27,13 +27,79 @@
 __device__ void load_manual(const uint8_t* sA, const uint8_t* sBk,
                             const uint8_t* sBn, unsigned (&a)[4],
                             unsigned (&b)[2]) {
-    (void)sA; (void)sBk; (void)sBn; (void)a; (void)b;
+
+    int lane = threadIdx.x;
+    int gid = lane >> 2;   // quad ID, 0..7
+    int tig = lane & 3;    // thread-in-quad, 
+
+    uint8_t* p = reinterpret_cast<uint8_t*>(a);
+    p[0] = sA[(gid) * 32 + tig * 4];
+    p[1] = sA[(gid) * 32 + tig * 4 + 1];
+    p[2] = sA[(gid) * 32 + tig * 4 + 2];
+    p[3] = sA[(gid) * 32 + tig * 4 + 3];
+    
+    p[4] = sA[(gid + 8) * 32 + tig * 4];
+    p[5] = sA[(gid + 8) * 32 + tig * 4 + 1];
+    p[6] = sA[(gid + 8) * 32 + tig * 4 + 2];
+    p[7] = sA[(gid + 8) * 32 + tig * 4 + 3];
+    
+    p[8] = sA[(gid) * 32 + tig * 4 + 16];
+    p[9] = sA[(gid) * 32 + tig * 4 + 17];
+    p[10] = sA[(gid) * 32 + tig * 4 + 18];
+    p[11] = sA[(gid) * 32 + tig * 4 + 19];
+    
+    p[12] = sA[(gid + 8) * 32 + tig * 4 + 16];
+    p[13] = sA[(gid + 8) * 32 + tig * 4 + 17];
+    p[14] = sA[(gid + 8) * 32 + tig * 4 + 18];
+    p[15] = sA[(gid + 8) * 32 + tig * 4 + 19];
+
+    p = reinterpret_cast<uint8_t*>(b);
+    p[0] = sBk[(tig * 4) * 8 + gid];
+    p[1] = sBk[(tig * 4 + 1) * 8 + gid];
+    p[2] = sBk[(tig * 4 + 2) * 8 + gid];
+    p[3] = sBk[(tig * 4 + 3) * 8 + gid];
+
+    p[4] = sBk[(tig * 4 + 16) * 8 + gid];
+    p[5] = sBk[(tig * 4 + 17) * 8 + gid];
+    p[6] = sBk[(tig * 4 + 18) * 8 + gid];
+    p[7] = sBk[(tig * 4 + 19) * 8 + gid];
+
 }
 
 __device__ void load_ldsm(const uint8_t* sA, const uint8_t* sBk,
                           const uint8_t* sBn, unsigned (&a)[4],
                           unsigned (&b)[2]) {
-    (void)sA; (void)sBk; (void)sBn; (void)a; (void)b;
+    const int lane = threadIdx.x;
+
+    const int rowA = lane & 15;
+    const int colA = (lane >> 4) * 16;
+
+    uint32_t addrA =
+        static_cast<uint32_t>(
+            __cvta_generic_to_shared(
+                sA + rowA * 32 + colA));
+
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
+        "{%0,%1,%2,%3}, [%4];"
+        : "=r"(a[0]), "=r"(a[1]),
+        "=r"(a[2]), "=r"(a[3])
+        : "r"(addrA));
+    
+    const int laneB = lane & 15;
+    const int colB = (laneB >> 3) * 16;
+    const int rowB = laneB & 7;
+
+    uint32_t addrB =
+        static_cast<uint32_t>(
+            __cvta_generic_to_shared(
+                sBn + rowB * 32 + colB));
+
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x2.shared.b16 "
+        "{%0,%1}, [%2];"
+        : "=r"(b[0]), "=r"(b[1])
+        : "r"(addrB));
 }
 
 template <bool USE_LDSM>

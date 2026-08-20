@@ -58,23 +58,37 @@ make run/m0_env/01_first_mma
 
 在你能使用的 GPU 上分别运行该程序（5090 使用 ARCH=120a make ...，B300 使用默认配置）。尝试使用不匹配的 ARCH 编译运行一次，记录现象，并结合 assignment01 Module 8 中 fatbin/JIT 的内容解释原因。可使用 make ptx/m0_env/01_first_mma 查看生成的 PTX。
 
+5090上运行成功，如使用默认配置出现no kernel image is available for execution on the device，ptx中有.target sm_120a。
+
 ### 0.2 {.prob type=DERIVE}
 
 推导你所使用 GPU 的 Tensor Core 理论峰值。参考课上 A100 的推导方法（S018--S019），分别计算 5090 和 B300 的 bf16 峰值，并根据 dtype 宽度关系估算 fp8 / fp4 峰值。
 
 开始计算前先明确采用的口径，包括 dense 或 sparse、boost 或 base 频率、FMA 是否计作 2 FLOP 等。完成推导后，再与 datasheet 中的官方数据进行对照；如果结果存在差异，需要说明差异来自哪一项口径。
 
+sparse, boost, FMA=2FLOP, 每指令4096FLOPS，指令延迟8 cycles
+
+- RTX 5090: SM 170, 每SM 4 Tensor Core, 频率2.407GHz
+
+4096 / 8 * 170 * 4 * 2.407GHz -> 838.2TFLOPS
+
+- B300: SM 160, 每SM 4 Tensor Core, 频率 1.78GHz
+
+8192 * 2 * 160 * 1.78GHz -> 4.67PFLOPS
+
 | 量 | 5090 | B300 |
 |---|---|---|
-| bf16 FLOP/cycle/SM | | |
-| bf16 峰值(TFLOPS) | | |
-| fp8 峰值(TFLOPS) | | |
-| fp4 峰值(TFLOPS) | | |
-| datasheet 对照值与口径差异 | | |
-| HBM/GDDR 带宽(GB/s) | | |
-| 机器平衡点(FLOP/byte，bf16) | | |
+| bf16 FLOP/cycle/SM | 2048 | 16384 |
+| bf16 峰值(TFLOPS) | 838.2 | 4666 |
+| fp8 峰值(TFLOPS) | 1676.4 | 9332 |
+| fp4 峰值(TFLOPS) | 3352.8 | 18664 |
+| datasheet 对照值与口径差异 | 838 / 1676 / 3352 | 4.5 / 9 / 18 PFLOPS |
+| HBM/GDDR 带宽(GB/s) | 1792 GB | 8000 GB |
+| 机器平衡点(FLOP/byte，bf16) | 468 | 562.5 |
 
 根据 bf16 峰值和显存带宽计算机器平衡点（FLOP/byte），并与单条 mma 的计算强度（S016，m16n8k16 fp16 为 3.2 FLOP/byte）比较。思考两者之间的差距意味着什么，以及为什么后续 M2--M4 需要从数据供给路径入手优化。
+
+同一份数据在更靠近 Tensor Core 的层级被尽可能多次复用，从而把整个 kernel 的有效 arithmetic intensity 提高。
 
 ### 0.3 {.prob type=CONCEPT}
 
@@ -83,14 +97,22 @@ make run/m0_env/01_first_mma
 (a) 一条 mma 的计算强度，分子是 $2MNK$，分母按 A、B 读入与 D 写回
 的字节总和计(S016 的口径)。
 
+正确。
+
 (b) mma.sync 是 warp 级协作指令:32 个 lane 各持 fragment 的一部分，
 要求全 warp 一致地执行这条指令；有 lane 发散时行为未定义。
+
+正确。
 
 (c) 增大 mma 的形状 M/N/K 能提高单条指令的计算强度，而且没有代价，
 所以指令形状越大越好。
 
+错误，提高单条指令的计算强度，但是会带来更多资源的压力。
+
 (d) 只要单条 mma 的计算强度低于机器平衡点，GEMM kernel 就不可能逼近
 计算峰值。
+
+错误，可以复用传来的数据。
 
 # sm80:fragment 与 mma.sync
 
@@ -120,6 +142,8 @@ make run/m1_sm80/01_fragment_map
 A 的同一个 b32 寄存器中的 4 个 fp8 元素沿矩阵哪个方向相邻？
 这个布局对 1.4 中使用 ldmatrix load 有什么影响？
 
+A同一个b32寄存器4个fp8元素沿行方向相邻，意味着需要数据重排，全局内存加载时不能直接按普通的行主序。
+
 ### 1.2 {.prob type=DEBUG file=cuda/m1_sm80/02_bug_fragment.cu}
 
 这个程序发一条 m16n8k16 fp16 mma，判测会 FAIL。先运行一遍，后改动:
@@ -127,6 +151,8 @@ A 的同一个 b32 寄存器中的 4 个 fp8 元素沿矩阵哪个方向相邻�
 (a) 描述症状：D 的哪些位置错、错成了什么(和对的部分是什么关系)；
 
 (b) 修好它，并解释错的是哪个 fragment 的哪部分映射，为什么恰好产生(a)的症状。
+
+D的下半部分错了，使用了错误的部分A的数据，A的2367直接和0145一样了，即A的下半部分用了上半部分的数据。
 
 ```
 cd assignment02/cuda
@@ -168,7 +194,11 @@ cd assignment02/cuda/m1_sm80
 
 (a) `ldmatrix` 省掉了手工装载中的哪些工作？
 
+ldmatrix 将 shared memory 到 Tensor Core fragment 的加载、lane 间数据重排以及 FP8 数据的 packed register 组织交给硬件完成，因此只需少量 ldmatrix 指令；手工路径则需要大量 ld.shared，以及 shl/and/or 等地址计算和 byte packing 指令。
+
 (b) 为什么这些工作在手工装载路径中无法避免？
+
+这些工作在手工路径中无法避免，因为 mma.sync 所需的 fragment 不是普通的连续内存布局，而是由 32 个 lane 协作、按 Tensor Core 指定的 lane/register layout 分布。手工路径必须显式完成 shared-memory 地址映射、跨 lane 的 fragment 对应关系以及 FP8 byte 到 packed register 的组装；ldmatrix 只是把这些固定的数据搬运和重排模式由专用硬件一次完成。
 
 ### 1.5 {.prob type=EXPERIMENT file=cuda/m1_sm80/05_ldsm_stride.cu}
 
@@ -186,14 +216,16 @@ ncu --metrics l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld.sum,l1tex__data_b
 
 | 档位 | 预测 wavefront 比 | 实测 wavefront | 实测 conflict | 平均 cycle |
 |---|---|---|---|---|
-| 32 B | | | | |
-| 64 B | | | | |
-| 128 B | | | | |
-| 128+16 B | | | | |
+| 32 B | 2x | 16384 | 8192 | 9.86 |
+| 64 B | 4x | 32768 | 24576 | 10.87 |
+| 128 B | 8x | 65536 | 57344 | 16.00 |
+| 128+16 B | 1x | 8192 | 0 | 9.42 |
 
 比较预测与实测结果：哪一种行跨度使 wavefront 数增加到 4 倍？
 wavefront 的比例应与 bank 模型一致，但实际耗时的差距通常没有这么大。
 结合 8 个 warp 的占用情况，解释为什么 wavefront 增加 4 倍并不会使总耗时也增加 4 倍。
+
+因为等待时SM可以调度别的warp。
 
 ::: lookback
 
