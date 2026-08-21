@@ -259,11 +259,26 @@ Memory Layout" 与 swizzling 小节。
 `wgmma.mma_async` / `st.shared` / `wgmma.commit_group` /
 `fence.proxy.async` / `wgmma.fence` / `wgmma.wait_group`
 
+`st.shared`->`fence.proxy.async`->`wgmma.fence`->`wgmma.mma_async`->`wgmma.commit_group`->`wgmma.wait_group`
+
+`fence.proxy.async`：等待generic proxy -> async proxy（store->wgmma可见）
+`wgmma.fence`：wgmma顺序边界（wgmma操作之间的顺序）
+`wgmma.commit_group`：之前发射的wgmma封入group
+`wgmma.wait_group`：等待group完成
+
 (b) 判断下列说法是否正确，并给出一句理由。
 
 1. `fence.proxy.async` 是 wgmma 专属的指令，TMA 与 tcgen05 的场景不需要它。
+
+错误。是generic proxy与async proxy之间内存可见性问题，所以后续也需要。
+
 2. `wgmma.commit_group` 会阻塞，直到它之前发射的 wgmma 全部完成。
+
+错误。wait_group才会阻塞，commit只会提交成group。
+
 3. 不加 `fence.proxy.async` 时，wgmma 可能读到 shared memory 中的旧值，因为 `st.shared` 的写经过 generic proxy，而 wgmma 的读经过 async proxy。
+
+正确。
 
 
 ### 2.2 {.prob type=DERIVE file=cuda/m2_smem/02_descriptor.cu}
@@ -283,6 +298,7 @@ make run/m2_smem/02_descriptor
 
 场景 2 和场景 3 最终得到的 descriptor 相同。在报告中回答：MN-major 与 K-major 的区别体现在哪里？
 
+MN-major与K-major的区别在这里没有体现在descriptor中，由 tcgen05.mma 对 A/B operand 的 major-mode/transpose 解释确定。
 
 ### 2.3 {.prob type=FROM-SCRATCH file=cuda/m2_smem/03_swizzle.cu}
 
