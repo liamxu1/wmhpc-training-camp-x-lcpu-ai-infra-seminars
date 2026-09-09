@@ -49,3 +49,4 @@ clean:
 	rm -rf bin */*.ptx
 
 .PHONY: run/% ptx/% clean
+# .PRECIOUS: bin/%

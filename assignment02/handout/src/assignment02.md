@@ -342,14 +342,24 @@ ld / fence）与 mbarrier 一节。
 
 (a) `tcgen05.ld` 读取 TMEM 时，每个 warp 只能读取自己对应的 32 条 lane，warp 之间不能互相读取。
 
+正确。
+
 (b) 与 `mma.sync` 由 warp 协作、wgmma 由 warpgroup 协作不同，`tcgen05.mma` 由单个线程发射，随后由硬件异步执行。
+
+正确。
 
 (c) TMEM 中的累加结果可以直接通过 TMA 搬回 global memory，不需要经过寄存器。
 
+错误。先搬到寄存器/SMEM。
+
 (d) TMEM 每个 SM 包含 128 lane × 512 column × 4 B；一个 m128n256 的 f32 accumulator 恰好占用其中一半。
+
+正确。
+128*256*4B
 
 (e) `tcgen05.commit` 会阻塞直到之前发射的 mma 全部完成，因此 commit 返回后即可安全读取 TMEM。
 
+错误。tcgen05.commit 的作用是 提交/刷新之前发射的异步操作，并不保证等待完成；要安全读取 TMEM 需使用 tcgen05.wait 或 tcgen05.fence 等同步指令，而非依赖 commit 返回。
 
 ::: {.capstone title="prob 3.2(FROM-SCRATCH):tcgen05 单 tile GEMM" file=cuda/m3_tcgen05/02_single_tile.cu}
 

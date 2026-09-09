@@ -53,17 +53,507 @@ __device__ inline void mbar_wait(uint32_t mbar, uint32_t phase) {
             : "r"(mbar), "r"(phase));
 }
 
-__global__ void tcgen05_tile(const __nv_bfloat16* gA, const __nv_bfloat16* gB,
+__global__ void tcgen05_tile(const __nv_bfloat16* gA,
+                             const __nv_bfloat16* gB,
                              float* gD) {
-    // TODO: 按七步实现。
-    // (1) mbarrier 初始化 + TMEM 分配(alloc 结果写到 shared,广播)
-    // (2) 全体线程把 A/B 按 swizzled 布局写进 smem
-    // (3) fence.proxy.async + __syncthreads
-    // (4) 单线程发射 4 条 k16 的 tcgen05.mma(第一条不累加),commit
-    // (5) mbarrier 等待
-    // (6) epilogue:每 warp tcgen05.ld 自己的 32 条 lane,写回 global
-    // (7) __syncthreads 后 dealloc
-    (void)gA; (void)gB; (void)gD;
+    constexpr int TMEM_COLS = 64;
+
+    constexpr int A_BYTES = M * K * sizeof(__nv_bfloat16); // 128*64*2 = 16384
+    constexpr int B_BYTES = N * K * sizeof(__nv_bfloat16); //  64*64*2 =  8192
+
+    constexpr int A_OFF = 0;
+    constexpr int B_OFF = A_BYTES;
+
+    // A + B staging.
+    // A: 16 KB
+    // B:  8 KB
+    __shared__ __align__(128) unsigned char smem[A_BYTES + B_BYTES];
+
+    // MMA completion barrier.
+    __shared__ __align__(8) uint64_t mma_mbar;
+
+    // tcgen05.alloc writes the TMEM base address here.
+    __shared__ __align__(4) uint32_t tmem_addr;
+
+    const int tid  = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+
+    const uint32_t smem_base =
+        static_cast<uint32_t>(
+            __cvta_generic_to_shared(smem));
+
+    const uint32_t a_smem = smem_base + A_OFF;
+    const uint32_t b_smem = smem_base + B_OFF;
+
+    const uint32_t mbar_addr =
+        static_cast<uint32_t>(
+            __cvta_generic_to_shared(&mma_mbar));
+
+    const uint32_t tmem_addr_smem =
+        static_cast<uint32_t>(
+            __cvta_generic_to_shared(&tmem_addr));
+
+    // ============================================================
+    // (1) mbarrier initialization + TMEM allocation
+    // ============================================================
+
+    // Only thread 0 initializes the mbarrier.
+    if (tid == 0) {
+        asm volatile(
+            "mbarrier.init.shared::cta.b64 [%0], 1;"
+            :
+            : "r"(mbar_addr)
+            : "memory");
+
+        // Make the mbarrier initialization visible to async proxy.
+        asm volatile(
+            "fence.mbarrier_init.release.cluster;"
+            ::: "memory");
+    }
+
+    // tcgen05.alloc is sync.aligned, so the whole warp executes it.
+    //
+    // We use warp 0 as the allocation warp.
+    if (warp == 0) {
+        asm volatile(
+            "tcgen05.alloc.cta_group::1.sync.aligned."
+            "shared::cta.b32 [%0], %1;"
+            :
+            : "r"(tmem_addr_smem),
+              "r"(TMEM_COLS)
+            : "memory");
+    }
+
+    // Wait until:
+    //   1. mbarrier is initialized
+    //   2. tcgen05.alloc has written tmem_addr
+    //   3. all threads see the staging setup
+    __syncthreads();
+
+    // The allocated TMEM base address.
+    const uint32_t tmem =
+        *reinterpret_cast<volatile uint32_t*>(&tmem_addr);
+
+    // ============================================================
+    // (2) Global -> SMEM
+    //
+    // Physical SMEM layout:
+    //
+    //   swz128(row, colByte)
+    //
+    // A is [M,K] = [128,64]
+    // B is [N,K] = [ 64,64]
+    //
+    // One row contains 64 bf16 = 128 bytes.
+    // ============================================================
+
+    uint16_t* smem16 =
+        reinterpret_cast<uint16_t*>(smem);
+
+    const uint16_t* gA16 =
+        reinterpret_cast<const uint16_t*>(gA);
+
+    const uint16_t* gB16 =
+        reinterpret_cast<const uint16_t*>(gB);
+
+    // -------------------------
+    // A: 128 x 64 bf16
+    // -------------------------
+    for (int idx = tid; idx < M * K; idx += blockDim.x) {
+        const int row = idx / K;
+        const int k   = idx % K;
+
+        const int colByte = k * 2;
+        const int off = swz128(row, colByte);
+
+        smem16[(A_OFF + off) >> 1] = gA16[idx];
+    }
+
+    // -------------------------
+    // B: 64 x 64 bf16
+    // -------------------------
+    for (int idx = tid; idx < N * K; idx += blockDim.x) {
+        const int row = idx / K;
+        const int k   = idx % K;
+
+        const int colByte = k * 2;
+        const int off = swz128(row, colByte);
+
+        smem16[(B_OFF + off) >> 1] = gB16[idx];
+    }
+
+    // ============================================================
+    // (3) Generic SMEM stores -> async proxy
+    //
+    // Required by the problem statement.
+    // ============================================================
+
+    asm volatile(
+        "fence.proxy.async.shared::cta;"
+        ::: "memory");
+
+    // Make all normal SMEM stores visible to all 128 threads.
+    __syncthreads();
+
+    // Synchronize the tcgen05 async proxy with the thread sync.
+    //
+    // This is the ordering point used by SM100 tcgen05 kernels
+    // before issuing MMA.
+    asm volatile(
+        "tcgen05.fence::after_thread_sync;"
+        ::: "memory");
+
+    // ============================================================
+    // Instruction descriptor
+    //
+    // BF16 x BF16 -> FP32
+    //
+    // MMA_M = 128
+    // MMA_N = 64
+    // MMA_K = 16
+    //
+    // PTX fields:
+    //   bit 4      : accumulator type FP32
+    //   bit 7      : A type BF16
+    //   bit 10     : B type BF16
+    //   bits 17..23: MMA_N / 8
+    //   bits 24..31: MMA_M / 16
+    // ============================================================
+
+    constexpr uint32_t IDESC =
+        (1u << 4) |
+        (1u << 7) |
+        (1u << 10) |
+        ((uint32_t(N) >> 3) << 17) |
+        ((uint32_t(M) >> 4) << 24);
+
+    // For this problem:
+    //
+    //   IDESC =
+    //       1<<4
+    //     | 1<<7
+    //     | 1<<10
+    //     | 8<<17
+    //     | 8<<24
+    //
+    // because N=64 and M=128.
+    //
+    // This is exactly the standard BF16->FP32 tcgen05.f16
+    // descriptor construction. 
+    //
+    // ============================================================
+
+    // ============================================================
+    // SMEM descriptor
+    //
+    // From problem 2.2:
+    //
+    // K-major + 128B swizzle
+    //
+    //   LBO    = 0
+    //   SBO    = 1024
+    //   layout = 2
+    //
+    // IMPORTANT:
+    // Do NOT change these to the no-swizzle descriptor values.
+    // These are the values validated by problem 2.2.
+    // ============================================================
+
+    auto make_desc = [](uint32_t addr) -> uint64_t {
+        uint64_t d = 0;
+
+        // start_address [0,14)
+        d |= (uint64_t)((addr >> 4) & 0x3FFF);
+
+        // LBO [16,30)
+        // 128B-swizzle: problem 2.2 says LBO = 0.
+        d |= 0ull << 16;
+
+        // SBO [32,46)
+        // 8 rows * 128 bytes = 1024 bytes.
+        d |= (uint64_t)((1024u >> 4) & 0x3FFF) << 32;
+
+        // version [46,48) = 1
+        d |= 1ull << 46;
+
+        // layout_type [61,64) = 128B swizzle = 2
+        d |= 2ull << 61;
+
+        return d;
+    };
+
+    // ============================================================
+    // (4) Four K=16 MMA instructions
+    //
+    // K = 64
+    // MMA_K = 16
+    //
+    // Therefore:
+    //
+    //   MMA #0: K [ 0,16)
+    //   MMA #1: K [16,32)
+    //   MMA #2: K [32,48)
+    //   MMA #3: K [48,64)
+    //
+    // With 128B swizzle, the descriptor starts for successive
+    // 16-K slices are:
+    //
+    //   + 0
+    //   +32
+    //   +64
+    //   +96
+    //
+    // This is the physical 32-byte stride of one MMA-K tile
+    // under the 128B-swizzled staging layout.
+    //
+    // Only one thread issues MMA.
+    // ============================================================
+
+    if (tid == 0) {
+
+        const uint64_t a0 = make_desc(a_smem + 0);
+        const uint64_t b0 = make_desc(b_smem + 0);
+
+        const uint64_t a1 = make_desc(a_smem + 32);
+        const uint64_t b1 = make_desc(b_smem + 32);
+
+        const uint64_t a2 = make_desc(a_smem + 64);
+        const uint64_t b2 = make_desc(b_smem + 64);
+
+        const uint64_t a3 = make_desc(a_smem + 96);
+        const uint64_t b3 = make_desc(b_smem + 96);
+
+        // --------------------------------------------------------
+        // MMA #0
+        //
+        // D = A0 * B0
+        //
+        // predicate = false:
+        // do NOT use the old TMEM accumulator.
+        // --------------------------------------------------------
+
+        asm volatile(
+            "{\n"
+            "    .reg .pred p;\n"
+            "    setp.eq.u32 p, 0, 1;\n"
+            "    tcgen05.mma.cta_group::1.kind::f16 "
+            "[%0], %1, %2, %3, "
+            "{%4,%5,%6,%7}, p;\n"
+            "}"
+            :
+            : "r"(tmem),
+              "l"(a0),
+              "l"(b0),
+              "r"(IDESC),
+              "r"(0u),
+              "r"(0u),
+              "r"(0u),
+              "r"(0u)
+            : "memory");
+
+        // --------------------------------------------------------
+        // MMA #1
+        //
+        // D += A1 * B1
+        // --------------------------------------------------------
+
+        asm volatile(
+            "{\n"
+            "    .reg .pred p;\n"
+            "    setp.eq.u32 p, 1, 1;\n"
+            "    tcgen05.mma.cta_group::1.kind::f16 "
+            "[%0], %1, %2, %3, "
+            "{%4,%5,%6,%7}, p;\n"
+            "}"
+            :
+            : "r"(tmem),
+              "l"(a1),
+              "l"(b1),
+              "r"(IDESC),
+              "r"(0u),
+              "r"(0u),
+              "r"(0u),
+              "r"(0u)
+            : "memory");
+
+        // --------------------------------------------------------
+        // MMA #2
+        //
+        // D += A2 * B2
+        // --------------------------------------------------------
+
+        asm volatile(
+            "{\n"
+            "    .reg .pred p;\n"
+            "    setp.eq.u32 p, 1, 1;\n"
+            "    tcgen05.mma.cta_group::1.kind::f16 "
+            "[%0], %1, %2, %3, "
+            "{%4,%5,%6,%7}, p;\n"
+            "}"
+            :
+            : "r"(tmem),
+              "l"(a2),
+              "l"(b2),
+              "r"(IDESC),
+              "r"(0u),
+              "r"(0u),
+              "r"(0u),
+              "r"(0u)
+            : "memory");
+
+        // --------------------------------------------------------
+        // MMA #3
+        //
+        // D += A3 * B3
+        // --------------------------------------------------------
+
+        asm volatile(
+            "{\n"
+            "    .reg .pred p;\n"
+            "    setp.eq.u32 p, 1, 1;\n"
+            "    tcgen05.mma.cta_group::1.kind::f16 "
+            "[%0], %1, %2, %3, "
+            "{%4,%5,%6,%7}, p;\n"
+            "}"
+            :
+            : "r"(tmem),
+              "l"(a3),
+              "l"(b3),
+              "r"(IDESC),
+              "r"(0u),
+              "r"(0u),
+              "r"(0u),
+              "r"(0u)
+            : "memory");
+    }
+
+    // ============================================================
+    // Commit all previously issued tcgen05.mma operations.
+    //
+    // IMPORTANT:
+    //
+    // It is .shared::cluster, NOT .shared::cta.
+    //
+    // This was the source of your previous ptxas error.
+    // ============================================================
+
+    if (tid == 0) {
+        asm volatile(
+            "tcgen05.commit.cta_group::1."
+            "mbarrier::arrive::one."
+            "shared::cluster.b64 [%0];"
+            :
+            : "r"(mbar_addr)
+            : "memory");
+    }
+
+    // ============================================================
+    // (5) Wait for MMA completion
+    // ============================================================
+
+    mbar_wait(mbar_addr, 0);
+
+    // ============================================================
+    // Before TMEM -> register loads.
+    //
+    // tcgen05.mma -> mbarrier wait -> thread synchronization
+    // boundary -> tcgen05.ld
+    // ============================================================
+
+    asm volatile(
+        "tcgen05.fence::after_thread_sync;"
+        ::: "memory");
+
+    // ============================================================
+    // (6) TMEM -> registers -> global
+    //
+    // 128 rows are split across 4 warps:
+    //
+    //   warp 0 -> rows   0..31
+    //   warp 1 -> rows  32..63
+    //   warp 2 -> rows  64..95
+    //   warp 3 -> rows  96..127
+    //
+    // Each .32x32b.x8 load:
+    //
+    //   32 lanes
+    //   x 8 FP32 values/lane
+    //
+    // covers 32 rows x 8 columns.
+    //
+    // N = 64 => 8 loads of 8 columns.
+    // ============================================================
+
+    const int row_base = warp * 32;
+
+    for (int n0 = 0; n0 < N; n0 += 8) {
+
+        float x[8];
+
+        // taddr:
+        //
+        //   high 16 bits = row offset
+        //   low  16 bits = column offset
+        //
+        // For Layout D:
+        //   local row = lane
+        //   warp selects 32-row partition.
+        //
+        const uint32_t addr =
+            tmem
+            + (static_cast<uint32_t>(row_base) << 16)
+            + static_cast<uint32_t>(n0);
+
+        asm volatile(
+            "tcgen05.ld.sync.aligned.32x32b.x8.b32 "
+            "{%0,%1,%2,%3,%4,%5,%6,%7}, [%8];"
+            : "=f"(x[0]),
+              "=f"(x[1]),
+              "=f"(x[2]),
+              "=f"(x[3]),
+              "=f"(x[4]),
+              "=f"(x[5]),
+              "=f"(x[6]),
+              "=f"(x[7])
+            : "r"(addr)
+            : "memory");
+
+        // tcgen05.ld is asynchronous.
+        asm volatile(
+            "tcgen05.wait::ld.sync.aligned;"
+            ::: "memory");
+
+        // Each lane corresponds to one row.
+        const int m = row_base + lane;
+
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            gD[m * N + n0 + j] = x[j];
+        }
+    }
+
+    // ============================================================
+    // All TMEM readers must finish before deallocation.
+    // ============================================================
+
+    __syncthreads();
+
+    // ============================================================
+    // (7) TMEM deallocation
+    //
+    // dealloc is sync.aligned, so all 32 lanes of warp 0 execute it.
+    // ============================================================
+
+    if (warp == 0) {
+        asm volatile(
+            "tcgen05.dealloc.cta_group::1."
+            "sync.aligned.b32 %0, %1;"
+            :
+            : "r"(tmem),
+              "r"(TMEM_COLS)
+            : "memory");
+    }
 }
 
 int main(int argc, char** argv) {
